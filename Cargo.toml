@@ -1,0 +1,12 @@
+[package]
+name = "puppyfier"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+color-eyre = "0.6.5"
+iced = "0.14.0"
+iced_aw = "0.14.1"
+left-right = "0.11.8"
+rand = "0.10.3"
+rdev = { version = "0.5.3", features = ["unstable_grab"] }
