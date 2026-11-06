@@ -1,16 +1,21 @@
 use std::{
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        mpsc::{self, channel},
+    },
     thread,
 };
 
 use color_eyre::Result;
 use iced::{
-    Alignment::{self},
-    Element, Length, Task, Theme,
-    widget::{column, pick_list, row, text, text_editor, toggler},
+    Alignment, Element, Length, Subscription, Task, Theme,
+    futures::{SinkExt, Stream},
+    widget::{button, column, pick_list, row, text, text_editor, toggler},
+    window,
 };
 use iced_aw::number_input;
 use rdev::grab;
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
 
 use crate::{
     lr_globalstate::{self, GlobalConfig, LRGlobalConfigReader, LRGlobalConfigWriter},
@@ -18,7 +23,7 @@ use crate::{
     ui::Message::ToggleEnabled,
 };
 
-static PUPPY_WORDS: &'static [&'static str] = &["woof", "arf", "wroof", "awoooo"];
+static PUPPY_WORDS: &'static [&'static str] = &["woof", "arf", "wroof", "awoooo", "bark"];
 static KITTY_WORDS: &'static [&'static str] = &["meow", "mrrp", "prrrr", "mprr", "meow"];
 
 static GLOBAL_CONFIG: LazyLock<Arc<(LRGlobalConfigReader, Mutex<LRGlobalConfigWriter>)>> =
@@ -35,6 +40,8 @@ pub struct App {
     enabled: bool,
     chosen_preset: usize,
     replacement_percentage: u32,
+    id: window::Id,
+    tray_icon: TrayIcon,
 }
 
 #[derive(Clone)]
@@ -43,6 +50,10 @@ enum Message {
     ChangeSelection(&'static str),
     EditInput(text_editor::Action),
     ChangePercentage(u32),
+    GotWindowId(window::Id),
+    Hide,
+    ShowWindow,
+    NoMessage,
 }
 
 impl App {
@@ -55,6 +66,7 @@ impl App {
             .theme(Self::theme)
             .title(Self::title)
             .window_size((350, 400))
+            .subscription(Self::subscription)
             .run()?;
         Ok(())
     }
@@ -67,14 +79,26 @@ impl App {
         String::from("Puppyfier")
     }
 
-    fn new() -> Self {
-        Self {
+    fn new() -> (Self, Task<Message>) {
+        let app = Self {
             input_content: text_editor::Content::with_text(&PUPPY_WORDS.join("\n")),
             presets: vec![("Puppy", PUPPY_WORDS), ("Kitty", KITTY_WORDS)],
             enabled: false,
             chosen_preset: 0,
             replacement_percentage: 20,
-        }
+            id: window::Id::unique(),
+            tray_icon: init_tray_icon(),
+        };
+        (
+            app,
+            window::latest().map(|id| {
+                if let Some(id) = id {
+                    Message::GotWindowId(id)
+                } else {
+                    Message::NoMessage
+                }
+            }),
+        )
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -109,10 +133,25 @@ impl App {
             ToggleEnabled(enabled) => {
                 self.enabled = enabled;
                 (*GLOBAL_CONFIG.1.lock().unwrap()).set_enabled(enabled);
+                _ = self.tray_icon.set_tooltip(Some(format!(
+                    "Puppyfier is {}",
+                    if enabled { "enabled" } else { "disabled" }
+                )));
+                _ = self.tray_icon.set_icon(Some(if enabled {
+                    icon_enabled()
+                } else {
+                    icon_disabled()
+                }));
             }
             Message::ChangePercentage(percentage) => {
                 self.replacement_percentage = percentage;
                 (*GLOBAL_CONFIG.1.lock().unwrap()).set_percentage(percentage);
+            }
+            Message::Hide => return iced::window::set_mode(self.id, window::Mode::Hidden),
+            Message::GotWindowId(id) => self.id = id,
+            Message::NoMessage => return Task::none(),
+            Message::ShowWindow => {
+                return window::set_mode(self.id, window::Mode::Windowed);
             }
         }
 
@@ -139,7 +178,7 @@ impl App {
         column![
             row![
                 toggler(self.enabled)
-                    .label("Toggle active")
+                    .label("Enabled")
                     .on_toggle(ToggleEnabled)
             ],
             row![text!("Insertion percentage:"), percentage_input, text!("%")]
@@ -147,15 +186,36 @@ impl App {
                 .align_y(Alignment::Center),
             pick_list(options, Some(selected_option), Message::ChangeSelection),
             text_input,
+            column![button("Hide to traybar").on_press(Message::Hide)].align_x(Alignment::End)
         ]
         .spacing(8)
         .padding(8)
         .into()
     }
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::run(subscription_tray_event_worker)
+    }
 }
 
 fn intercept_keyboard() {
     grab(handle_keyboard_event).unwrap();
+}
+
+fn load_icon_from_bytes(bytes: &[u8]) -> tray_icon::Icon {
+    let img = image::load_from_memory(bytes).unwrap();
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Icon::from_rgba(rgba.into_raw(), width, height).unwrap()
+}
+
+fn icon_enabled() -> tray_icon::Icon {
+    static ICON_ENABLED: &[u8] = include_bytes!("../assets/keyboard.png");
+    load_icon_from_bytes(ICON_ENABLED)
+}
+
+fn icon_disabled() -> tray_icon::Icon {
+    static ICON_DISABLED: &[u8] = include_bytes!("../assets/keyboard_off.png");
+    load_icon_from_bytes(ICON_DISABLED)
 }
 
 fn handle_keyboard_event(event: rdev::Event) -> Option<rdev::Event> {
@@ -177,4 +237,43 @@ fn handle_keyboard_event(event: rdev::Event) -> Option<rdev::Event> {
     };
 
     if propagate { Some(event) } else { None }
+}
+
+fn init_tray_icon() -> TrayIcon {
+    TrayIcon::builder()
+        .with_id("com.shoudev.puppyfier")
+        .with_tooltip("Puppyfier is disabled")
+        .with_icon(icon_disabled())
+        .build()
+        .unwrap()
+}
+
+fn subscription_tray_event_worker() -> impl Stream<Item = Message> {
+    iced::stream::channel(
+        100,
+        |mut output: iced::futures::channel::mpsc::Sender<_>| async move {
+            let (sender, receiver) = channel();
+            println!("Before spawining");
+            thread::spawn(move || {
+                while let Ok(event) = TrayIconEvent::receiver().recv() {
+                    _ = sender.send(event);
+                }
+            });
+
+            while let Ok(msg) = receiver.recv() {
+                match msg {
+                    TrayIconEvent::Click {
+                        id: _,
+                        position: _,
+                        rect: _,
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Down,
+                    } => {
+                        output.send(Message::ShowWindow).await.unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        },
+    )
 }
