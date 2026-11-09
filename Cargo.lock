@@ -3682,6 +3682,7 @@ dependencies = [
  "rand 0.10.3",
  "rdev",
  "tray-icon",
+ "windows 0.62.2",
 ]
 
 [[package]]

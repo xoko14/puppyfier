@@ -1,12 +1,11 @@
 use std::{
-    sync::{
-        Arc, LazyLock, Mutex,
-        mpsc::{self, channel},
-    },
+    os::raw::c_void,
+    sync::{Arc, LazyLock, Mutex, mpsc::channel},
     thread,
 };
 
 use color_eyre::Result;
+#[allow(unused_imports)]
 use iced::{
     Alignment, Element, Length, Subscription, Task, Theme,
     futures::{SinkExt, Stream},
@@ -16,6 +15,10 @@ use iced::{
 use iced_aw::number_input;
 use rdev::grab;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconEvent};
+use windows::Win32::{
+    Foundation::HWND,
+    UI::WindowsAndMessaging::{SW_SHOWDEFAULT, ShowWindow},
+};
 
 use crate::{
     lr_globalstate::{self, GlobalConfig, LRGlobalConfigReader, LRGlobalConfigWriter},
@@ -34,6 +37,8 @@ static GLOBAL_CONFIG: LazyLock<Arc<(LRGlobalConfigReader, Mutex<LRGlobalConfigWr
         Arc::new((r, Mutex::new(w)))
     });
 
+static NATIVE_WINDOW_ID: LazyLock<Arc<Mutex<u64>>> = LazyLock::new(|| Arc::new(Mutex::new(0)));
+
 pub struct App {
     input_content: text_editor::Content,
     presets: Vec<(&'static str, &'static [&'static str])>,
@@ -51,7 +56,9 @@ enum Message {
     EditInput(text_editor::Action),
     ChangePercentage(u32),
     GotWindowId(window::Id),
+    GotNativeWindowId(u64),
     Hide,
+    #[allow(dead_code)]
     ShowWindow,
     NoMessage,
 }
@@ -147,11 +154,34 @@ impl App {
                 self.replacement_percentage = percentage;
                 (*GLOBAL_CONFIG.1.lock().unwrap()).set_percentage(percentage);
             }
-            Message::Hide => return iced::window::set_mode(self.id, window::Mode::Hidden),
-            Message::GotWindowId(id) => self.id = id,
+            Message::Hide => {
+                #[cfg(target_os = "windows")]
+                {
+                    let window_id = *NATIVE_WINDOW_ID.lock().unwrap();
+                    let data = window_id as *mut c_void;
+                    let hwnd = HWND(data);
+                    unsafe {
+                        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+                        _ = ShowWindow(hwnd, SW_HIDE);
+                    }
+                    return Task::none();
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    return iced::window::set_mode(self.id, window::Mode::Hidden);
+                }
+            }
+            Message::GotWindowId(id) => {
+                self.id = id;
+                return window::raw_id::<Message>(id).map(|o| Message::GotNativeWindowId(o));
+            }
             Message::NoMessage => return Task::none(),
             Message::ShowWindow => {
                 return window::set_mode(self.id, window::Mode::Windowed);
+            }
+            Message::GotNativeWindowId(native_window_id) => {
+                *NATIVE_WINDOW_ID.lock().unwrap() = native_window_id;
             }
         }
 
@@ -251,9 +281,10 @@ fn init_tray_icon() -> TrayIcon {
 fn subscription_tray_event_worker() -> impl Stream<Item = Message> {
     iced::stream::channel(
         100,
+        #[allow(unused_mut)]
+        #[allow(unused_variables)]
         |mut output: iced::futures::channel::mpsc::Sender<_>| async move {
             let (sender, receiver) = channel();
-            println!("Before spawining");
             thread::spawn(move || {
                 while let Ok(event) = TrayIconEvent::receiver().recv() {
                     _ = sender.send(event);
@@ -269,7 +300,19 @@ fn subscription_tray_event_worker() -> impl Stream<Item = Message> {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Down,
                     } => {
-                        output.send(Message::ShowWindow).await.unwrap();
+                        #[cfg(target_os = "windows")]
+                        {
+                            let window_id = *NATIVE_WINDOW_ID.lock().unwrap();
+                            let data = window_id as *mut c_void;
+                            let hwnd = HWND(data);
+                            unsafe {
+                                _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
+                            }
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            output.send(Message::ShowWindow).await.unwrap();
+                        }
                     }
                     _ => {}
                 }
